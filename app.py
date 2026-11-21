@@ -817,7 +817,21 @@ def build_fastapi_app():
     return api
 
 
-fastapi_app = build_fastapi_app()
+fastapi_app = None
+
+
+def get_fastapi_app():
+    """Build the FastAPI app lazily, inside the container.
+
+    `modal deploy` executes this module locally first, and the local
+    environment does not have the container image's packages (fastapi
+    and friends) installed — building the app at import time would
+    crash the deploy before it even starts.
+    """
+    global fastapi_app
+    if fastapi_app is None:
+        fastapi_app = build_fastapi_app()
+    return fastapi_app
 
 # ---------------------------------------------------------------------------
 # cloudflared (started next to the HTTP server inside the container)
@@ -883,7 +897,7 @@ class Backend:
         def run():
             import uvicorn
 
-            uvicorn.run(fastapi_app, host="0.0.0.0", port=PORT, log_level="info")
+            uvicorn.run(get_fastapi_app(), host="0.0.0.0", port=PORT, log_level="info")
 
         threading.Thread(target=run, name="uvicorn", daemon=True).start()
         deadline = time.time() + 120
