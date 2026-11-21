@@ -328,6 +328,7 @@ class Session:
         self.intake_done = False
         self.intake_error = None
         self.expected_total = None  # upload mode: declared by the client
+        self.total_override = None  # urls mode: len(submitted urls), rejected included
         self.received = 0
         self.items = {}  # idx -> {"name", "kind": url|file, "src", "seq"}
         self.done = {}  # idx -> output filename
@@ -337,6 +338,8 @@ class Session:
         self.lock = threading.Lock()
 
     def total(self):
+        if self.total_override is not None:
+            return self.total_override
         if self.mode == "upload":
             return self.expected_total if self.expected_total is not None else len(self.items)
         return len(self.items)
@@ -655,26 +658,30 @@ def build_fastapi_app():
         scale = int(body.get("scale") or 4)
         if scale not in (2, 3, 4):
             return fail(400, "scale must be 2, 3 or 4")
-        accepted, rejected = [], 0
-        for u in urls:
-            if not isinstance(u, str) or not u.startswith("http"):
-                rejected += 1
-            elif ORIGINAL_LINK_RE.search(u):
-                rejected += 1  # originals are not accepted for SR
-            else:
-                accepted.append(u)
-        if not accepted:
-            return fail(400, "no acceptable image urls (original-image links are rejected)")
         session.mode = "urls"
         session.scale = scale
         session.submitted = True
         session.intake_done = True
-        for i, u in enumerate(accepted):
+        # Items keep the index of the submitted list (rejected urls are
+        # recorded as errors at their own index) so the client can map
+        # per-file results back to its images by index alone.
+        session.total_override = len(urls)
+        accepted = 0
+        for i, u in enumerate(urls):
+            if not isinstance(u, str) or not u.startswith("http"):
+                session.errors[i] = "not an http(s) url"
+                continue
+            if ORIGINAL_LINK_RE.search(u):
+                session.errors[i] = "original-image links are rejected"
+                continue
             name = Path(u.split("?")[0]).name or f"image_{i}.jpg"
             if Path(name).suffix.lower() not in IMAGE_EXTS:
                 name += ".jpg"
             manager().enqueue(session, i, {"name": name, "kind": "url", "src": u})
-        return {"accepted": len(accepted), "rejected": rejected, "total": len(accepted)}
+            accepted += 1
+        if not accepted:
+            return fail(400, "no acceptable image urls (original-image links are rejected)")
+        return {"accepted": accepted, "rejected": len(urls) - accepted, "total": len(urls)}
 
     @api.post("/sr/submit-archive")
     async def submit_archive(request: Request):
@@ -794,6 +801,13 @@ def build_fastapi_app():
         }
         if session.intake_error:
             payload["error"] = session.intake_error
+        # Per-file results: the client downloads each finished image on
+        # its own (by index) instead of waiting for the packed result.
+        payload["doneItems"] = [{"index": i, "name": session.done[i]} for i in sorted(session.done)]
+        payload["failedItems"] = [
+            {"index": i, "name": (session.items.get(i) or {}).get("name", f"image_{i}")}
+            for i in sorted(session.errors)
+        ]
         return payload
 
     @api.get("/sr/result")
@@ -806,6 +820,22 @@ def build_fastapi_app():
             return fail(409, "result is not ready yet")
         session.downloaded_at = time.time()
         return FileResponse(zip_path, media_type="application/zip", filename="super_resolution.zip")
+
+    @api.get("/sr/file/{idx}")
+    async def sr_file(request: Request, idx: int):
+        session = session_from(request)
+        if session is None:
+            return fail(401, "unknown session")
+        name = session.done.get(idx)
+        if name is None:
+            return fail(404, "file is not ready")
+        path = session.dir / "out" / name
+        if not path.exists():
+            return fail(404, "file is missing")
+        import mimetypes
+
+        media_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        return FileResponse(path, media_type=media_type, filename=name)
 
     @api.delete("/sr/session")
     async def sr_cancel(request: Request):
