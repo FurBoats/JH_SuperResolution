@@ -102,6 +102,7 @@ RESULT_KEEP_SECONDS = 30 * 60
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
+    .apt_install("curl", "ca-certificates")
     .pip_install(
         "torch==2.3.1",
         "fastapi",
